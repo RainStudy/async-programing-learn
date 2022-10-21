@@ -1,31 +1,21 @@
 package suspend
 
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.*
 
-suspend fun main() {
-    println(Thread.currentThread().name)
-    test1()
-    println(Thread.currentThread().name)
-    test2()
-    println("3")
-    test3()
-    println("4")
-    test4()
+private val scheduler = Executors.newScheduledThreadPool(1) {
+    Thread(it).apply { isDaemon = true }
 }
 
-suspend fun test1() {
+fun main() = runBlocking {
     delay(1000)
+    delay(1000)
+    delay(1000)
+    println(test())
 }
 
-suspend fun test2() {
-    delay(1000)
-}
-
-suspend fun test3() {
-    delay(1000)
-}
-
-suspend fun test4() {
-    delay(1000)
+suspend fun test() = suspendCoroutine {
+    scheduler.schedule({ it.resumeWith(Result.success("Hello World")) }, 1, TimeUnit.SECONDS)
 }

@@ -6,7 +6,7 @@
 
 ## 什么是协程？
 
-我们先来给协程下个定义，只要我们可以控制一段逻辑在尚未执行完成时让出控制权，让其他逻辑得到控制权，这个东西就可以称作协程。这么说，你是不是想到了什么？Java的线程提供了一个方法让出当前线程所占有的时间分片（也就是控制权）`Thread#yield()`，说实话我很少用到它，它一般用来实现高效的多线程抢占式调度。所以我们也可以把java的线程看作一种协程的实现。
+我们先来给协程下个定义，只要我们可以控制一段逻辑在尚未执行完成时让出控制权，让其他逻辑得到控制权（换句话说，能够切换调用栈），这个东西就可以称作协程。这么说，你是不是想到了什么？Java的线程提供了一个方法让出当前线程所占有的时间分片（也就是控制权）`Thread#yield()`，说实话我很少用到它，它一般用来实现高效的多线程抢占式调度。所以我们也可以把java的线程看作一种协程的实现。
 
 那么要如何让出？在何时何地可以让出？让出了之后要怎么恢复（如何调度）？于是根据这三个问题便区分出了有栈/无栈协程，对称/非对称协程的概念。
 
@@ -86,9 +86,11 @@ suspend fun main() {
 
 是的，不重要。因为你要怎么说他都能找到一种合理的解释。你要说他是无栈协程，他当然是无栈协程，suspend函数底层就是通过状态机的状态流转，闭包语法实现，它也没有保存协程栈，也不能在非挂起函数调用时挂起。你要说他是有栈协程，也可以这么说，因为我们使用launch启动的协程中可以在其中任意嵌套suspend函数，也就是可以在任意挂起点挂起，这又是有栈协程的重要特性之一。而对称与非对称协程更是不必多说，我的评价是两者皆有。只要能通晓它的底层实现，便不用垢泥于片面的文字定义。
 
-## 源码分析
+## 源码分析 - 基础设施
 
-> 话不多说，直接开冲
+> 由标准库与编译器魔法实现的协程基础设施，能够实现最基础的挂起恢复，提供协程API的底层支持。
+>
+> 我们一般用不上这些API，但一旦要对kotlin协程刨根问底，它就永远是我们必须跨过的一道坎。
 
 ### Suspend Function & Suspend Lambda
 
@@ -129,7 +131,7 @@ public static final Object test(@NotNull Continuation<? super Unit> $completion)
 >
 > 这样做函数执行结果可以通过续体回调传递到外部，并且可以传递多次。
 >
-> 协程里通过在CPS的Continuation回调里结合状态机(CoroutineContext)流转，来实现协程挂起-恢复的功能.
+> 协程里通过在CPS的Continuation回调里结合状态机流转，来实现协程挂起-恢复的功能.
 
 > ## 关于Unit的编译器优化
 >
@@ -761,5 +763,635 @@ notify了我们之前wait的主线程，控制权回到主线程，这时java的
 
 好像还有个intercept没分析，之后再说吧。
 
+## 源码分析 - 上层建筑
+
+> 基于标准库提供的简单协程API实现的协程框架，对各种使用场景做了完备的封装。
+
+### suspendCoroutine
+
+这是一个封装程度相对较低，但又非常好用的一个函数。实际上kt协程绝大多数有用的挂起函数都是基于它封装的，我们可以用它将回调转为协程。
+
+我们看看它的实现
+
+~~~kotlin
+public suspend inline fun <T> suspendCoroutine(crossinline block: (Continuation<T>) -> Unit): T {
+    contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
+    return suspendCoroutineUninterceptedOrReturn { c: Continuation<T> ->
+        val safe = SafeContinuation(c.intercepted())
+        block(safe)
+        safe.getOrThrow()
+    }
+}
+~~~
+
+嗯，包了个SafeContinuation，核心逻辑还是在`suspendCoroutineUninterceptedOrReturn`里面，那我们接着看
+
+~~~kotlin
+@SinceKotlin("1.3")
+@InlineOnly
+@Suppress("UNUSED_PARAMETER", "RedundantSuspendModifier")
+public suspend inline fun <T> suspendCoroutineUninterceptedOrReturn(crossinline block: (Continuation<T>) -> Any?): T {
+    contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
+    throw NotImplementedError("Implementation of suspendCoroutineUninterceptedOrReturn is intrinsic")
+}
+~~~
+
+嗯？没了？它也不是什么用except修饰的多平台函数，也没有什么单独的平台实现。
+
+那么只有一种可能了——编译期魔法。正好这两个函数都是inline的，我们直接反编译看他长啥样就好了。
+
+~~~kotlin
+private val scheduler = Executors.newScheduledThreadPool(1) {
+    Thread(it).apply { isDaemon = true }
+}
+
+suspend fun test() = suspendCoroutine {
+    scheduler.schedule({
+        it.resumeWith(Result.success("Hello World"))
+    }, 1, TimeUnit.SECONDS)
+}
+~~~
+
+直接看反编译后的test函数长啥样
+
+~~~java
+@Nullable
+   public static final Object test(@NotNull Continuation $completion) {
+      SafeContinuation var2 = new SafeContinuation(IntrinsicsKt.intercepted($completion));
+      Continuation it = (Continuation)var2;
+      int var4 = false;
+      scheduler.schedule((Runnable)(new SuspendFuncKt$test$2$1(it)), 1L, TimeUnit.SECONDS);
+      Object var10000 = var2.getOrThrow();
+      if (var10000 == IntrinsicsKt.getCOROUTINE_SUSPENDED()) {
+         DebugProbesKt.probeCoroutineSuspended($completion);
+      }
+
+      return var10000;
+   }
+
+// SuspendFuncKt$test$2$1.java
+package suspend;
+
+import kotlin.Metadata;
+import kotlin.Result;
+import kotlin.coroutines.Continuation;
+
+@Metadata(
+   mv = {1, 7, 1},
+   k = 3,
+   d1 = {"\u0000\b\n\u0000\n\u0002\u0010\u0002\n\u0000\u0010\u0000\u001a\u00020\u0001H\n¢\u0006\u0002\b\u0002"},
+   d2 = {"<anonymous>", "", "run"}
+)
+final class SuspendFuncKt$test$2$1 implements Runnable {
+   // $FF: synthetic field
+   final Continuation $it;
+
+   public final void run() {
+      Result.Companion var1 = Result.Companion;
+      String var2 = "Hello World";
+      this.$it.resumeWith(Result.constructor-impl(var2));
+   }
+
+   SuspendFuncKt$test$2$1(Continuation var1) {
+      this.$it = var1;
+   }
+}
+~~~
+
+看来只是拿到了调用者的continuation，然后传进回调而已，不过kotlin代码确实不能直接拿到调用者的continuation，所以采用了编译器魔法。
+
+### CoroutineContext / CoroutineScope
+
+#### CoroutineContext
+
+好吧，其实最开始我们就注意到了，Continuation中有一个context的成员。CoroutineContext是一种类似map的数据结构，但它的键值对中的键其实是对应值类的伴生对象，也就是说可以加到CoroutineContext的对象在出生时便找到了自己的位置。
+
+```kotlin
+@SinceKotlin("1.3")
+public interface ContinuationInterceptor : CoroutineContext.Element {
+    /**
+     * The key that defines *the* context interceptor.
+     */
+    companion object Key : CoroutineContext.Key<ContinuationInterceptor>
+    // ...
+}
+
+// 使用时
+val context = //...
+context += CoroutineName("Redrock coroutine")
+val interceptor = context[ContinuationInterceptor]
+// or
+// val interceptor = context.get(ContinuationInterceptor)
+```
+
+那么让我们来简单列举一下常用的CoroutineContext
+
+- CoroutineName 当前协程名称
+
+- CoroutineExceptionHandler 异常处理器
+
+- CoroutineInterceptor 拦截器 
+	- CoroutineDispatcher 调度器 (实际上是拦截器的一个实现)
+	
+##### CoroutineDispatcher
+
+~~~kotlin
+public abstract class CoroutineDispatcher :
+    AbstractCoroutineContextElement(ContinuationInterceptor), ContinuationInterceptor {
+            public final override fun <T> interceptContinuation(continuation: Continuation<T>): Continuation<T> =
+        DispatchedContinuation(this, continuation)
+
+    public final override fun releaseInterceptedContinuation(continuation: Continuation<*>) {
+        val dispatched = continuation as DispatchedContinuation<*>
+        dispatched.release()
+    }
+        
+    // ...
+}
+~~~
+
+嗯，看起来就是套了一层`DispatchedContinuation`
+
+~~~kotlin
+internal class DispatchedContinuation<in T>(
+    @JvmField val dispatcher: CoroutineDispatcher,
+    @JvmField val continuation: Continuation<T>
+) : DispatchedTask<T>(MODE_UNINITIALIZED), CoroutineStackFrame, Continuation<T> by continuation {
+    // ...
+    
+    override fun resumeWith(result: Result<T>) {
+        val context = continuation.context
+        val state = result.toState()
+        if (dispatcher.isDispatchNeeded(context)) {
+            _state = state
+            resumeMode = MODE_ATOMIC
+            dispatcher.dispatch(context, this)
+        } else {
+            executeUnconfined(state, MODE_ATOMIC) {
+                withCoroutineContext(this.context, countOrElement) {
+                    continuation.resumeWith(result)
+                }
+            }
+        }
+    }
+}
+~~~
+
+会使用传入的dispatcher去执行这个DispatchedTask（其实就是提交一个恢复协程的任务给调度器调度）。`Dispatchers.Unconfined`除外，如果使用这个调度器协程会在当前线程立刻恢复。然后再想想我们如何开启一个协程？ 创建，拦截，然后立刻恢复。这就可以理解为什么我们使用`withContext(Dispatchers.Unconfined)`第一次挂起之前是在调用函数所在的线程，第一次挂起之后就到了DeafultExecutor上。
+
+#### CoroutineScope
+
+这个就是我们经常用到的东西了，一般我们使用`CoroutineScope#launch()`来开启顶部协程，我们来看看它的这个构造函数。
+
+~~~kotlin
+@Suppress("FunctionName")
+public fun CoroutineScope(context: CoroutineContext): CoroutineScope =
+    ContextScope(if (context[Job] != null) context else context + Job())
+~~~
+
+实际上是创建了一个`ContextScope`，如果启动的时候没有指定job就给context加上一个job。
+
+```kotlin
+public interface CoroutineScope {
+    public val coroutineContext: CoroutineContext
+}
+```
+
+~~~kotlin
+internal class ContextScope(context: CoroutineContext) : CoroutineScope {
+    override val coroutineContext: CoroutineContext = context
+    // CoroutineScope is used intentionally for user-friendly representation
+    override fun toString(): String = "CoroutineScope(coroutineContext=$coroutineContext)"
+}
+~~~
+
+结果发现CoroutineScope这个接口就只有一个context的参数，也就是说CoroutineScope啥也不是，就是一个存储context的容器。
+
+等等，那些我们经常用到的方法呢？launch，async，cancel...弄了半天居然是拓展函数，也就是说其实只要有一个context就能实现这些操作。
+
+##### launch
+
+~~~kotlin
+public fun CoroutineScope.launch(
+    context: CoroutineContext = EmptyCoroutineContext,
+    start: CoroutineStart = CoroutineStart.DEFAULT,
+    block: suspend CoroutineScope.() -> Unit
+): Job {
+    val newContext = newCoroutineContext(context)
+    val coroutine = if (start.isLazy)
+        LazyStandaloneCoroutine(newContext, block) else
+        StandaloneCoroutine(newContext, active = true)
+    coroutine.start(start, coroutine, block)
+    return coroutine
+}
+~~~
+
+嗯，封装成了`StandaloneCoroutine`与`LazyStandaloneCoroutine`。
+
+```kotlin
+private open class StandaloneCoroutine(
+    parentContext: CoroutineContext,
+    active: Boolean
+) : AbstractCoroutine<Unit>(parentContext, initParentJob = true, active = active) {
+    override fun handleJobException(exception: Throwable): Boolean {
+        handleCoroutineException(context, exception)
+        return true
+    }
+}
+
+private class LazyStandaloneCoroutine(
+    parentContext: CoroutineContext,
+    block: suspend CoroutineScope.() -> Unit
+) : StandaloneCoroutine(parentContext, active = false) {
+    private val continuation = block.createCoroutineUnintercepted(this, this)
+
+    override fun onStart() {
+        continuation.startCoroutineCancellable(this)
+    }
+}
+```
+
+根本没做什么事情，直接看父类逻辑就行
+
+~~~kotlin
+public fun <R> start(start: CoroutineStart, receiver: R, block: suspend R.() -> T) {
+        start(block, receiver, this)
+}
+~~~
+
+emm? 这个start不是个枚举吗？哦，原来重写了invoke
+
+~~~kotlin
+	@InternalCoroutinesApi
+    public operator fun <T> invoke(block: suspend () -> T, completion: Continuation<T>): Unit =
+        when (this) {
+            DEFAULT -> block.startCoroutineCancellable(completion)
+            ATOMIC -> block.startCoroutine(completion)
+            UNDISPATCHED -> block.startCoroutineUndispatched(completion)
+            LAZY -> Unit // will start lazily
+        }
+~~~
+
+就是简单的start了一个coroutine。
+
+##### async
+
+~~~kotlin
+public fun <T> CoroutineScope.async(
+    context: CoroutineContext = EmptyCoroutineContext,
+    start: CoroutineStart = CoroutineStart.DEFAULT,
+    block: suspend CoroutineScope.() -> T
+): Deferred<T> {
+    val newContext = newCoroutineContext(context)
+    val coroutine = if (start.isLazy)
+        LazyDeferredCoroutine(newContext, block) else
+        DeferredCoroutine<T>(newContext, active = true)
+    coroutine.start(start, coroutine, block)
+    return coroutine
+}
+~~~
+
+我们先看看LazyDeferredCoroutine和DeferredCoroutine
+
+```kotlin
+private open class DeferredCoroutine<T>(
+    parentContext: CoroutineContext,
+    active: Boolean
+) : AbstractCoroutine<T>(parentContext, true, active = active), Deferred<T>, SelectClause1<T> {
+    override fun getCompleted(): T = getCompletedInternal() as T
+    override suspend fun await(): T = awaitInternal() as T
+    override val onAwait: SelectClause1<T> get() = this
+    override fun <R> registerSelectClause1(select: SelectInstance<R>, block: suspend (T) -> R) =
+        registerSelectClause1Internal(select, block)
+}
+
+private class LazyDeferredCoroutine<T>(
+    parentContext: CoroutineContext,
+    block: suspend CoroutineScope.() -> T
+) : DeferredCoroutine<T>(parentContext, active = false) {
+    private val continuation = block.createCoroutineUnintercepted(this, this)
+
+    override fun onStart() {
+        continuation.startCoroutineCancellable(this)
+    }
+}
+```
+
+这次跟launch又有那么点不一样了，DeferredCoroutine实现了Deferred。还有一个SelectClause1是用于select操作的，这里我们暂时先放着。先看看await和getCompleted的具体实现
+
+~~~kotlin
+	internal suspend fun awaitInternal(): Any? {
+        // fast-path -- check state (avoid extra object creation)
+        while (true) { // lock-free loop on state
+            val state = this.state
+            if (state !is Incomplete) {
+                // already complete -- just return result
+                if (state is CompletedExceptionally) { // Slow path to recover stacktrace
+                    recoverAndThrow(state.cause)
+                }
+                return state.unboxState()
+
+            }
+            if (startInternal(state) >= 0) break // break unless needs to retry
+        }
+        return awaitSuspend() // slow-path
+    }
+
+    private suspend fun awaitSuspend(): Any? = suspendCoroutineUninterceptedOrReturn { uCont ->
+        /*
+         * Custom code here, so that parent coroutine that is using await
+         * on its child deferred (async) coroutine would throw the exception that this child had
+         * thrown and not a JobCancellationException.
+         */
+        val cont = AwaitContinuation(uCont.intercepted(), this)
+        // we are mimicking suspendCancellableCoroutine here and call initCancellability, too.
+        cont.initCancellability()
+        cont.disposeOnCancellation(invokeOnCompletion(ResumeAwaitOnCompletion(cont).asHandler))
+        cont.getResult()
+    }
+~~~
+
+这是`JobSupport`的方法，`AbstractCoroutine`继承于JobSupport。一旦调用await就死循环读取state等待到执行完成为止再获取执行结果。看来async也就这么回事。
+
+##### cancel
+
+```kotlin
+public fun CoroutineScope.cancel(cause: CancellationException? = null) {
+    val job = coroutineContext[Job] ?: error("Scope cannot be cancelled because it does not have a job: $this")
+    job.cancel(cause)
+}
+```
+
+就是调用了`Job#cancel`，Job的源码我们在后面研究
+
+### delay
+
+总之先看看源码
+
+~~~kotlin
+public suspend fun delay(timeMillis: Long) {
+    if (timeMillis <= 0) return // don't delay
+    return suspendCancellableCoroutine sc@ { cont: CancellableContinuation<Unit> ->
+        // if timeMillis == Long.MAX_VALUE then just wait forever like awaitCancellation, don't schedule.
+        if (timeMillis < Long.MAX_VALUE) {
+            cont.context.delay.scheduleResumeAfterDelay(timeMillis, cont)
+        }
+    }
+}
+~~~
+
+原理很简单对吧，一看就懂。但你以为我想研究的是这个delay吗？其实是context中的delay调度器哒！
+
+~~~kotlin
+internal val CoroutineContext.delay: Delay get() = get(ContinuationInterceptor) as? Delay ?: DefaultDelay
+~~~
+
+首先拿到context里的拦截器，如果是Delay就使用它，如果不存在或不是Delay就使用默认的。仔细想想，他这样拿会拿到什么？没错，就是拿到调度器！Delay只是一个接口，所有的调度器都实现了这个接口。
+
+还记得我们之前看suspend main源码时做的一个小测试吗，在函数因`delay`挂起之前函数由主线程执行，而挂起一次后执行它的线程变成了什么？还记得吗？
+
+> kotlinx.coroutines.DefaultExecutor
+
+那这个DefaultDelay估计就是直接用的Default调度器吧，看看代码来验证我的猜想
+
+```kotlin
+internal actual val DefaultDelay: Delay = initializeDefaultDelay()
+
+private fun initializeDefaultDelay(): Delay {
+    // Opt-out flag
+    if (!defaultMainDelayOptIn) return DefaultExecutor
+    val main = Dispatchers.Main
+    /*
+     * When we already are working with UI and Main threads, it makes
+     * no sense to create a separate thread with timer that cannot be controller
+     * by the UI runtime.
+     */
+    return if (main.isMissing() || main !is Delay) DefaultExecutor else main
+}
+```
+
+果然，有main的时候选main调度器，没有的时候选Default。然后就到我们的重头戏了，我们看看DefaultExecutor的实现
+
+~~~kotlin
+internal actual object DefaultExecutor : EventLoopImplBase(), Runnable {
+    // ...
+}
+~~~
+
+先看看这个父类，`EventLoopImplBase`，这一看就知道是个什么玩意了，一个事件循环，类似线程池的玩意。同时它还实现了`Runnable`接口，我猜测它的run方法就是用于在某个线程上把这个事件循环跑起来的。我们先不急着看run方法里的逻辑，先看看`scheduleResumeAfterDelay(timeMillis, cont)`，这个延时resume的方法。
+
+~~~kotlin
+public override fun scheduleResumeAfterDelay(timeMillis: Long, continuation: CancellableContinuation<Unit>) {
+        val timeNanos = delayToNanos(timeMillis)
+        if (timeNanos < MAX_DELAY_NS) {
+            val now = nanoTime()
+            DelayedResumeTask(now + timeNanos, continuation).also { task ->
+                /*
+                 * Order is important here: first we schedule the heap and only then
+                 * publish it to continuation. Otherwise, `DelayedResumeTask` would
+                 * have to know how to be disposed of even when it wasn't scheduled yet.
+                 */
+                schedule(now, task)
+                continuation.disposeOnCancellation(task)
+            }
+        }
+    }
+~~~
+
+这看起来简直跟线程池如出一辙，那么scheule多半就是向线程池中提交任务咯。cool，接下来找到`DelayedResumeTask`和`schedule`的源码
+
+~~~kotlin
+private inner class DelayedResumeTask(
+        nanoTime: Long,
+        private val cont: CancellableContinuation<Unit>
+    ) : DelayedTask(nanoTime) {
+        override fun run() { with(cont) { resumeUndispatched(Unit) } }
+        override fun toString(): String = super.toString() + cont.toString()
+    }
+
+public fun schedule(now: Long, delayedTask: DelayedTask) {
+        when (scheduleImpl(now, delayedTask)) {
+            SCHEDULE_OK -> if (shouldUnpark(delayedTask)) unpark()
+            SCHEDULE_COMPLETED -> reschedule(now, delayedTask)
+            SCHEDULE_DISPOSED -> {} // do nothing -- task was already disposed
+            else -> error("unexpected result")
+        }
+    }
+
+private fun scheduleImpl(now: Long, delayedTask: DelayedTask): Int {
+        if (isCompleted) return SCHEDULE_COMPLETED
+        val delayedQueue = _delayed.value ?: run {
+            _delayed.compareAndSet(null, DelayedTaskQueue(now))
+            _delayed.value!!
+        }
+        return delayedTask.scheduleTask(now, delayedQueue, this)
+    }
+
+private fun shouldUnpark(task: DelayedTask): Boolean = _delayed.value?.peek() === task
+
+protected actual open fun reschedule(now: Long, delayedTask: EventLoopImplBase.DelayedTask) {
+        DefaultExecutor.schedule(now, delayedTask)
+}
+~~~
+
+~~~kotlin
+@Synchronized
+fun scheduleTask(now: Long, delayed: DelayedTaskQueue, eventLoop: EventLoopImplBase): Int {
+    if (_heap === DISPOSED_TASK) return SCHEDULE_DISPOSED
+    delayed.addLastIf(this) { firstTask ->
+        if (eventLoop.isCompleted) return SCHEDULE_COMPLETED
+        if (firstTask == null) {
+            delayed.timeNow = now
+        } else {
+            val firstTime = firstTask.nanoTime
+            val minTime = if (firstTime - now >= 0) now else firstTime
+            if (minTime - delayed.timeNow > 0) delayed.timeNow = minTime
+        }
+        if (nanoTime - delayed.timeNow < 0) nanoTime = delayed.timeNow
+        true
+    }
+    return SCHEDULE_OK
+}
+~~~
+
+scheduleTask就是将任务放入任务队列，如果被任务被取消就立刻返回。
+
+`DelayedResumeTask`凭这点信息看不出什么名堂。schedule的逻辑倒也简单，首先拿队列，如果队列没有初始化就初始化队列，然后将这个任务放入任务队列，如果放入成功，scheduleImpl返回SCHEDULE_OK，便开始判断这个任务是否需要从任务队列中取出。
+
+~~~kotlin
+private fun shouldUnpark(task: DelayedTask): Boolean = _delayed.value?.peek() === task
+~~~
+
+~~~kotlin
+protected actual fun unpark() {
+        val thread = thread // atomic read
+        if (Thread.currentThread() !== thread)
+            unpark(thread)
+    }
+~~~
+
+嗯，反正就是这个任务是否被排到队列的头部，如果没有被处理就说明事件循环所在线程正在休眠，唤醒它。
+
+我们看看DefaultExecutor这个EventLoopBaseImpl的实现，这里拿线程也有需要注意的地方，这个线程是懒加载的，如果调用时没有的话会立刻创建一个线程。
+
+~~~kotlin
+	@Volatile
+    private var _thread: Thread? = null
+
+    override val thread: Thread
+        get() = _thread ?: createThreadSync()
+	
+	@Synchronized
+    private fun createThreadSync(): Thread {
+        return _thread ?: Thread(this, THREAD_NAME).apply {
+            _thread = this
+            isDaemon = true
+            start()
+        }
+    }
+~~~
+
+创建的还是一个守护线程，所以不会影响程序的退出。最后我们看一下DefaultExecutor的run方法就差不多了
+
+~~~kotlin
+override fun run() {
+        ThreadLocalEventLoop.setEventLoop(this)
+        registerTimeLoopThread()
+        try {
+            var shutdownNanos = Long.MAX_VALUE
+            if (!notifyStartup()) return
+            while (true) {
+                Thread.interrupted() // just reset interruption flag
+                var parkNanos = processNextEvent()
+                if (parkNanos == Long.MAX_VALUE) {
+                    // nothing to do, initialize shutdown timeout
+                    val now = nanoTime()
+                    if (shutdownNanos == Long.MAX_VALUE) shutdownNanos = now + KEEP_ALIVE_NANOS
+                    val tillShutdown = shutdownNanos - now
+                    if (tillShutdown <= 0) return // shut thread down
+                    parkNanos = parkNanos.coerceAtMost(tillShutdown)
+                } else
+                    shutdownNanos = Long.MAX_VALUE
+                if (parkNanos > 0) {
+                    // check if shutdown was requested and bail out in this case
+                    if (isShutdownRequested) return
+                    parkNanos(this, parkNanos)
+                }
+            }
+        } finally {
+            _thread = null // this thread is dead
+            acknowledgeShutdownIfNeeded()
+            unregisterTimeLoopThread()
+            // recheck if queues are empty after _thread reference was set to null (!!!)
+            if (!isEmpty) thread // recreate thread if it is needed
+        }
+    }
+~~~
+
+只看核心逻辑，首先进入一个死循环，重设interruption flag，尝试处理下一次任务（如果队列首的任务执行时间已经达到则立刻执行并返回再下一次任务需要停顿的时间，如果没有达到则返回下一个任务需要停顿的时间）并拿到停顿时间，处于性能考虑让线程休眠（休眠时cpu不会给当前线程分配时间片，避免浪费cpu性能）。如果中途有新任务插入，如果其处于队列首则唤醒线程。如果队列中没有任务则进入关闭流程，在等待KEEP_ALIVE_NANOS之后退出死循环，并进入关闭流程。这不就是一个线程池嘛？
+
 ### runBlocking
+
+~~~kotlin
+/**
+ * Runs a new coroutine and **blocks** the current thread _interruptibly_ until its completion.
+ * This function should not be used from a coroutine. It is designed to bridge regular blocking code
+ * to libraries that are written in suspending style, to be used in `main` functions and in tests.
+ *
+ * The default [CoroutineDispatcher] for this builder is an internal implementation of event loop that processes continuations
+ * in this blocked thread until the completion of this coroutine.
+ * See [CoroutineDispatcher] for the other implementations that are provided by `kotlinx.coroutines`.
+ *
+ * When [CoroutineDispatcher] is explicitly specified in the [context], then the new coroutine runs in the context of
+ * the specified dispatcher while the current thread is blocked. If the specified dispatcher is an event loop of another `runBlocking`,
+ * then this invocation uses the outer event loop.
+ *
+ * If this blocked thread is interrupted (see [Thread.interrupt]), then the coroutine job is cancelled and
+ * this `runBlocking` invocation throws [InterruptedException].
+ *
+ * See [newCoroutineContext][CoroutineScope.newCoroutineContext] for a description of debugging facilities that are available
+ * for a newly created coroutine.
+ *
+ * @param context the context of the coroutine. The default value is an event loop on the current thread.
+ * @param block the coroutine code.
+ */
+@Throws(InterruptedException::class)
+public actual fun <T> runBlocking(context: CoroutineContext, block: suspend CoroutineScope.() -> T): T {
+    contract {
+        callsInPlace(block, InvocationKind.EXACTLY_ONCE)
+    }
+    val currentThread = Thread.currentThread()
+    val contextInterceptor = context[ContinuationInterceptor]
+    val eventLoop: EventLoop?
+    val newContext: CoroutineContext
+    if (contextInterceptor == null) {
+        // create or use private event loop if no dispatcher is specified
+        eventLoop = ThreadLocalEventLoop.eventLoop
+        newContext = GlobalScope.newCoroutineContext(context + eventLoop)
+    } else {
+        // See if context's interceptor is an event loop that we shall use (to support TestContext)
+        // or take an existing thread-local event loop if present to avoid blocking it (but don't create one)
+        eventLoop = (contextInterceptor as? EventLoop)?.takeIf { it.shouldBeProcessedFromContext() }
+            ?: ThreadLocalEventLoop.currentOrNull()
+        newContext = GlobalScope.newCoroutineContext(context)
+    }
+    val coroutine = BlockingCoroutine<T>(newContext, currentThread, eventLoop)
+    coroutine.start(CoroutineStart.DEFAULT, coroutine, block)
+    return coroutine.joinBlocking()
+}
+~~~
+
+首先拿了当前线程，然后从context里拿了interceptor。如果interceptor为空就说明没有指定Dispatcher，就直接尝试从当前线程拿ThreadLocalEventLoop，并且新建了一个context（就是传入的context加上这个eventloop），如果不为空就直接取这个eventloop。然后创建一个BlockingCoroutine，然后start。start之后我们调用joinBlocking并将其返回，这个方法一看就知道是要堵塞当前线程到挂起函数执行完成。
+
+### withContext
+
+### coroutineScope
+
+### Job
+
+### Channel
+
+### Flow
+
+### select
 
