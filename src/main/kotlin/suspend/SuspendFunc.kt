@@ -9,11 +9,10 @@ private val scheduler = Executors.newScheduledThreadPool(1) {
     Thread(it).apply { isDaemon = true }
 }
 
-fun main() = runBlocking {
+suspend fun main() {
+    withContext(Dispatchers.Unconfined) { yield() }
     delay(1000)
-    delay(1000)
-    delay(1000)
-    println(test())
+    yield()
 }
 
 suspend fun test() = suspendCoroutine {

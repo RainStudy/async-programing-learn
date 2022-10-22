@@ -1011,7 +1011,7 @@ private class LazyStandaloneCoroutine(
 }
 ```
 
-根本没做什么事情，直接看父类逻辑就行
+根本没做什么事情，直接看父类`AbstractCoroutine`逻辑就行
 
 ~~~kotlin
 public fun <R> start(start: CoroutineStart, receiver: R, block: suspend R.() -> T) {
@@ -1111,7 +1111,7 @@ private class LazyDeferredCoroutine<T>(
     }
 ~~~
 
-这是`JobSupport`的方法，`AbstractCoroutine`继承于JobSupport。一旦调用await就死循环读取state等待到执行完成为止再获取执行结果。看来async也就这么回事。
+这是`JobSupport`的方法，`AbstractCoroutine`继承于JobSupport。首先尝试是否已经执行完成，如果执行完成就直接返回执行结果，如果尚未执行完成就挂起等待。
 
 ##### cancel
 
@@ -1122,7 +1122,7 @@ public fun CoroutineScope.cancel(cause: CancellationException? = null) {
 }
 ```
 
-就是调用了`Job#cancel`，Job的源码我们在后面研究
+就是调用了`Job#cancel()`，Job的源码我们在后面研究。
 
 ### delay
 
@@ -1198,7 +1198,7 @@ public override fun scheduleResumeAfterDelay(timeMillis: Long, continuation: Can
     }
 ~~~
 
-这看起来简直跟线程池如出一辙，那么scheule多半就是向线程池中提交任务咯。cool，接下来找到`DelayedResumeTask`和`schedule`的源码
+这看起来简直跟线程池如出一辙，那么schedule多半就是向线程池中提交任务咯。cool，接下来找到`DelayedResumeTask`和`schedule`的源码
 
 ~~~kotlin
 private inner class DelayedResumeTask(
@@ -1333,28 +1333,6 @@ override fun run() {
 ### runBlocking
 
 ~~~kotlin
-/**
- * Runs a new coroutine and **blocks** the current thread _interruptibly_ until its completion.
- * This function should not be used from a coroutine. It is designed to bridge regular blocking code
- * to libraries that are written in suspending style, to be used in `main` functions and in tests.
- *
- * The default [CoroutineDispatcher] for this builder is an internal implementation of event loop that processes continuations
- * in this blocked thread until the completion of this coroutine.
- * See [CoroutineDispatcher] for the other implementations that are provided by `kotlinx.coroutines`.
- *
- * When [CoroutineDispatcher] is explicitly specified in the [context], then the new coroutine runs in the context of
- * the specified dispatcher while the current thread is blocked. If the specified dispatcher is an event loop of another `runBlocking`,
- * then this invocation uses the outer event loop.
- *
- * If this blocked thread is interrupted (see [Thread.interrupt]), then the coroutine job is cancelled and
- * this `runBlocking` invocation throws [InterruptedException].
- *
- * See [newCoroutineContext][CoroutineScope.newCoroutineContext] for a description of debugging facilities that are available
- * for a newly created coroutine.
- *
- * @param context the context of the coroutine. The default value is an event loop on the current thread.
- * @param block the coroutine code.
- */
 @Throws(InterruptedException::class)
 public actual fun <T> runBlocking(context: CoroutineContext, block: suspend CoroutineScope.() -> T): T {
     contract {
@@ -1365,7 +1343,6 @@ public actual fun <T> runBlocking(context: CoroutineContext, block: suspend Coro
     val eventLoop: EventLoop?
     val newContext: CoroutineContext
     if (contextInterceptor == null) {
-        // create or use private event loop if no dispatcher is specified
         eventLoop = ThreadLocalEventLoop.eventLoop
         newContext = GlobalScope.newCoroutineContext(context + eventLoop)
     } else {
@@ -1381,13 +1358,513 @@ public actual fun <T> runBlocking(context: CoroutineContext, block: suspend Coro
 }
 ~~~
 
-首先拿了当前线程，然后从context里拿了interceptor。如果interceptor为空就说明没有指定Dispatcher，就直接尝试从当前线程拿ThreadLocalEventLoop，并且新建了一个context（就是传入的context加上这个eventloop），如果不为空就直接取这个eventloop。然后创建一个BlockingCoroutine，然后start。start之后我们调用joinBlocking并将其返回，这个方法一看就知道是要堵塞当前线程到挂起函数执行完成。
+首先拿了当前线程，然后从context里拿了interceptor。如果interceptor为空就说明没有指定Dispatcher，就直接尝试从当前线程拿ThreadLocalEventLoop，并且新建了一个context（就是传入的context加上这个eventloop），如果不为空就直接取这个eventloop。然后创建一个BlockingCoroutine，然后start。start之后我们调用joinBlocking并将其返回，这个方法一看就知道是要堵塞当前线程到挂起函数执行完成。这么看来，关键的代码肯定在BlockingCoroutine里面。
+
+~~~kotlin
+private class BlockingCoroutine<T>(
+    parentContext: CoroutineContext,
+    private val blockedThread: Thread,
+    private val eventLoop: EventLoop?
+) : AbstractCoroutine<T>(parentContext, true, true) {
+
+    override val isScopedCoroutine: Boolean get() = true
+
+    override fun afterCompletion(state: Any?) {
+        // wake up blocked thread
+        if (Thread.currentThread() != blockedThread)
+            unpark(blockedThread)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun joinBlocking(): T {
+        registerTimeLoopThread()
+        try {
+            eventLoop?.incrementUseCount()
+            try {
+                while (true) {
+                    @Suppress("DEPRECATION")
+                    if (Thread.interrupted()) throw InterruptedException().also { cancelCoroutine(it) }
+                    val parkNanos = eventLoop?.processNextEvent() ?: Long.MAX_VALUE
+                    // note: process next even may loose unpark flag, so check if completed before parking
+                    if (isCompleted) break
+                    parkNanos(this, parkNanos)
+                }
+            } finally { // paranoia
+                eventLoop?.decrementUseCount()
+            }
+        } finally { // paranoia
+            unregisterTimeLoopThread()
+        }
+        // now return result
+        val state = this.state.unboxState()
+        (state as? CompletedExceptionally)?.let { throw it.cause }
+        return state as T
+    }
+}
+~~~
+
+好像也没做什么出格的事，就是一个joinBlocking，重写了afterCompletion在执行完成时唤醒所在线程。
+
+然后joinBlocking的实现也跟delay中的事件循环如出一辙，就是在当前线程拉起了一个事件循环，执行完成后结束堵塞，原理很简单。
 
 ### withContext
 
+先看看代码
+
+~~~kotlin
+public suspend fun <T> withContext(
+    context: CoroutineContext,
+    block: suspend CoroutineScope.() -> T
+): T {
+    contract {
+        callsInPlace(block, InvocationKind.EXACTLY_ONCE)
+    }
+    return suspendCoroutineUninterceptedOrReturn sc@ { uCont ->
+        // compute new context
+        val oldContext = uCont.context
+        // Copy CopyableThreadContextElement if necessary
+        val newContext = oldContext.newCoroutineContext(context)
+        // always check for cancellation of new context
+        newContext.ensureActive()
+        // FAST PATH #1 -- new context is the same as the old one
+        if (newContext === oldContext) {
+            val coroutine = ScopeCoroutine(newContext, uCont)
+            return@sc coroutine.startUndispatchedOrReturn(coroutine, block)
+        }
+        // FAST PATH #2 -- the new dispatcher is the same as the old one (something else changed)
+        // `equals` is used by design (see equals implementation is wrapper context like ExecutorCoroutineDispatcher)
+        if (newContext[ContinuationInterceptor] == oldContext[ContinuationInterceptor]) {
+            val coroutine = UndispatchedCoroutine(newContext, uCont)
+            // There are changes in the context, so this thread needs to be updated
+            withCoroutineContext(newContext, null) {
+                return@sc coroutine.startUndispatchedOrReturn(coroutine, block)
+            }
+        }
+        // SLOW PATH -- use new dispatcher
+        val coroutine = DispatchedCoroutine(newContext, uCont)
+        block.startCoroutineCancellable(coroutine, coroutine)
+        coroutine.getResult()
+    }
+}
+~~~
+
+如果新旧Context一样就直接包装成`ScopeCoroutine`，然后startUndispatched，为什么undispatched？因为不存在线程的切换，就直接在当前线程上resume了。
+
+```kotlin
+internal open class ScopeCoroutine<in T>(
+    context: CoroutineContext,
+    @JvmField val uCont: Continuation<T> // unintercepted continuation
+) : AbstractCoroutine<T>(context, true, true), CoroutineStackFrame {
+
+    final override val callerFrame: CoroutineStackFrame? get() = uCont as? CoroutineStackFrame
+    final override fun getStackTraceElement(): StackTraceElement? = null
+
+    final override val isScopedCoroutine: Boolean get() = true
+    internal val parent: Job? get() = parentHandle?.parent
+
+    override fun afterCompletion(state: Any?) {
+        // Resume in a cancellable way by default when resuming from another context
+        uCont.intercepted().resumeCancellableWith(recoverResult(state, uCont))
+    }
+
+    override fun afterResume(state: Any?) {
+        // Resume direct because scope is already in the correct context
+        uCont.resumeWith(recoverResult(state, uCont))
+    }
+}
+```
+
+可以看到`ScopeCoroutine`是在afterCompletion中恢复的协程，直接用`ScopeCoroutine`的话也意味着调用者会等待withContext执行完成再继续往下执行。
+
+如果context不同，但调度器没有发生改变，就将新的context包装成一个`UndispatchedCoroutine`然后start。
+
+~~~kotlin
+internal actual class UndispatchedCoroutine<in T>actual constructor (
+    context: CoroutineContext,
+    uCont: Continuation<T>
+) : ScopeCoroutine<T>(if (context[UndispatchedMarker] == null) context + UndispatchedMarker else context, uCont) {
+
+    private var threadStateToRecover = ThreadLocal<Pair<CoroutineContext, Any?>>()
+
+    init {
+        if (uCont.context[ContinuationInterceptor] !is CoroutineDispatcher) {
+            val values = updateThreadContext(context, null)
+            restoreThreadContext(context, values)
+            saveThreadContext(context, values)
+        }
+    }
+
+    fun saveThreadContext(context: CoroutineContext, oldValue: Any?) {
+        threadStateToRecover.set(context to oldValue)
+    }
+
+    fun clearThreadContext(): Boolean {
+        if (threadStateToRecover.get() == null) return false
+        threadStateToRecover.set(null)
+        return true
+    }
+
+    override fun afterResume(state: Any?) {
+        threadStateToRecover.get()?.let { (ctx, value) ->
+            restoreThreadContext(ctx, value)
+            threadStateToRecover.set(null)
+        }
+        // resume undispatched -- update context but stay on the same dispatcher
+        val result = recoverResult(state, uCont)
+        withContinuationContext(uCont, null) {
+            uCont.resumeWith(result)
+        }
+    }
+}
+~~~
+
+看样子就是ScopeCoroutine稍作修改。会把新的context和线程状态存在ThreadLocal，在执行完成时将其清除。并且在resume时会切换回旧的context。
+
+如果以上两种情况都不是，那就是要切换调度器了，直接使用DispatchedCoroutine
+
+~~~kotlin
+val coroutine = DispatchedCoroutine(newContext, uCont)
+block.startCoroutineCancellable(coroutine, coroutine)
+coroutine.getResult()
+~~~
+
+start之后挂起到withContext中的逻辑执行完成。
+
 ### coroutineScope
 
+~~~kotlin
+public suspend fun <R> coroutineScope(block: suspend CoroutineScope.() -> R): R {
+    contract {
+        callsInPlace(block, InvocationKind.EXACTLY_ONCE)
+    }
+    return suspendCoroutineUninterceptedOrReturn { uCont ->
+        val coroutine = ScopeCoroutine(uCont.context, uCont)
+        coroutine.startUndispatchedOrReturn(coroutine, block)
+    }
+}
+~~~
+
+这个简单，就是拿了continuation里的context新起了一个ScopeCoroutine。一般我们用这个方法从挂起函数中拿到当前的CoroutineScope进行launch，async等操作。
+
 ### Job
+
+这个可是重点，得好好说道说道。
+
+~~~kotlin
+@Suppress("FunctionName")
+public fun Job(parent: Job? = null): CompletableJob = JobImpl(parent)
+~~~
+
+不出意料，它的所谓构造方法其实是一个顶级函数。我们看看它的实际实现JobImpl
+
+```kotlin
+internal open class JobImpl(parent: Job?) : JobSupport(true), CompletableJob {
+    init { initParentJob(parent) }
+    override val onCancelComplete get() = true
+    override val handlesException: Boolean = handlesException()
+    override fun complete() = makeCompleting(Unit)
+    override fun completeExceptionally(exception: Throwable): Boolean =
+        makeCompleting(CompletedExceptionally(exception))
+
+    @JsName("handlesExceptionF")
+    private fun handlesException(): Boolean {
+        var parentJob = (parentHandle as? ChildHandleNode)?.job ?: return false
+        while (true) {
+            if (parentJob.handlesException) return true
+            parentJob = (parentJob.parentHandle as? ChildHandleNode)?.job ?: return false
+        }
+    }
+}
+```
+
+更上层的job实现在`JobSupport`中。它的内部维护了一个State，并进行状态流转。下面我们简单分析一下job的几个常见用法
+
+#### start
+
+有时我们会开启一个`LaunchMode.LAZY`的协程，这种协程不会立刻启动，需要我们调用job的start()方法。
+
+```kotlin
+public final override fun start(): Boolean {
+    loopOnState { state ->
+        when (startInternal(state)) {
+            FALSE -> return false
+            TRUE -> return true
+        }
+    }
+}
+
+private fun startInternal(state: Any?): Int {
+        when (state) {
+            is Empty -> { // EMPTY_X state -- no completion handlers
+                if (state.isActive) return FALSE // already active
+                if (!_state.compareAndSet(state, EMPTY_ACTIVE)) return RETRY
+                onStart()
+                return TRUE
+            }
+            is InactiveNodeList -> { // LIST state -- inactive with a list of completion handlers
+                if (!_state.compareAndSet(state, state.list)) return RETRY
+                onStart()
+                return TRUE
+            }
+            else -> return FALSE // not a new state
+        }
+    }
+
+protected open fun onStart() {}
+```
+
+实际逻辑看来是在onStart里面，交给了子类处理。具体实现在哪里呢？还记得上面分析过的`LazyStandaloneCoroutine`吗
+
+~~~kotlin
+private class LazyStandaloneCoroutine(
+    parentContext: CoroutineContext,
+    block: suspend CoroutineScope.() -> Unit
+) : StandaloneCoroutine(parentContext, active = false) {
+    private val continuation = block.createCoroutineUnintercepted(this, this)
+
+    override fun onStart() {
+        continuation.startCoroutineCancellable(this)
+    }
+}
+~~~
+
+刚好重写了onStart。async的那个同理。
+
+#### cancel
+
+```kotlin
+public override fun cancel(cause: CancellationException?) {
+    cancelInternal(cause ?: defaultCancellationException())
+}
+
+public open fun cancelInternal(cause: Throwable) {
+    cancelImpl(cause)
+}
+
+internal fun cancelImpl(cause: Any?): Boolean {
+    var finalState: Any? = COMPLETING_ALREADY
+    if (onCancelComplete) {
+        // make sure it is completing, if cancelMakeCompleting returns state it means it had make it
+        // completing and had recorded exception
+        finalState = cancelMakeCompleting(cause)
+        if (finalState === COMPLETING_WAITING_CHILDREN) return true
+    }
+    if (finalState === COMPLETING_ALREADY) {
+        finalState = makeCancelling(cause)
+    }
+    return when {
+        finalState === COMPLETING_ALREADY -> true
+        finalState === COMPLETING_WAITING_CHILDREN -> true
+        finalState === TOO_LATE_TO_CANCEL -> false
+        else -> {
+            afterCompletion(finalState)
+            true
+        }
+    }
+}
+
+private fun makeCancelling(cause: Any?): Any? {
+    var causeExceptionCache: Throwable? = null // lazily init result of createCauseException(cause)
+    loopOnState { state ->
+        when (state) {
+            is Finishing -> { // already finishing -- collect exceptions
+                val notifyRootCause = synchronized(state) {
+                    if (state.isSealed) return TOO_LATE_TO_CANCEL // already sealed -- cannot add exception nor mark cancelled
+                    // add exception, do nothing is parent is cancelling child that is already being cancelled
+                    val wasCancelling = state.isCancelling // will notify if was not cancelling
+                    // Materialize missing exception if it is the first exception (otherwise -- don't)
+                    if (cause != null || !wasCancelling) {
+                        val causeException = causeExceptionCache ?: createCauseException(cause).also { causeExceptionCache = it }
+                        state.addExceptionLocked(causeException)
+                    }
+                    // take cause for notification if was not in cancelling state before
+                    state.rootCause.takeIf { !wasCancelling }
+                }
+                notifyRootCause?.let { notifyCancelling(state.list, it) }
+                return COMPLETING_ALREADY
+            }
+            is Incomplete -> {
+                // Not yet finishing -- try to make it cancelling
+                val causeException = causeExceptionCache ?: createCauseException(cause).also { causeExceptionCache = it }
+                if (state.isActive) {
+                    // active state becomes cancelling
+                    if (tryMakeCancelling(state, causeException)) return COMPLETING_ALREADY
+                } else {
+                    // non active state starts completing
+                    val finalState = tryMakeCompleting(state, CompletedExceptionally(causeException))
+                    when {
+                        finalState === COMPLETING_ALREADY -> error("Cannot happen in $state")
+                        finalState === COMPLETING_RETRY -> return@loopOnState
+                        else -> return finalState
+                    }
+                }
+            }
+            else -> return TOO_LATE_TO_CANCEL // already complete
+        }
+    }
+}
+```
+
+具体实现可以溯源到`makeCancelling`。主要逻辑就是拿到Cancel的Exception塞到state里面，然后异常到上一级协程被捕获，再被上抛...这样一层层到了launch所在的层级被捕获，并不再抛出。
+
+这里没有详细分析，其实我没怎么看懂，之后再说
+
+#### join
+
+看看`JobSupport`里面的实现
+
+```kotlin
+public final override suspend fun join() {
+    if (!joinInternal()) { // fast-path no wait
+        coroutineContext.ensureActive()
+        return // do not suspend
+    }
+    return joinSuspend() // slow-path wait
+}
+
+private fun joinInternal(): Boolean {
+   	loopOnState { state ->
+       if (state !is Incomplete) return false // not active anymore (complete) -- no need to wait
+       if (startInternal(state) >= 0) return true // wait unless need to retry
+    }
+}
+```
+
+```kotlin
+// returns: RETRY/FALSE/TRUE:
+//   FALSE when not new,
+//   TRUE  when started
+//   RETRY when need to retry
+private fun startInternal(state: Any?): Int {
+    when (state) {
+        is Empty -> { // EMPTY_X state -- no completion handlers
+            if (state.isActive) return FALSE // already active
+            if (!_state.compareAndSet(state, EMPTY_ACTIVE)) return RETRY
+            onStart()
+            return TRUE
+        }
+        is InactiveNodeList -> { // LIST state -- inactive with a list of completion handlers
+            if (!_state.compareAndSet(state, state.list)) return RETRY
+            onStart()
+            return TRUE
+        }
+        else -> return FALSE // not a new state
+    }
+}
+
+private const val RETRY = -1
+private const val FALSE = 0
+private const val TRUE = 1
+```
+
+```kotlin
+private suspend fun joinSuspend() = suspendCancellableCoroutine<Unit> { cont ->
+    // We have to invoke join() handler only on cancellation, on completion we will be resumed regularly without handlers
+    cont.disposeOnCancellation(invokeOnCompletion(handler = ResumeOnCompletion(cont).asHandler))
+}
+```
+
+如果state不是Incomplete的话就不需要挂起，直接返回。然后尝试启动这个job（因为有lazy启动的情况），启动无论成功失败都直接进到挂起流程。这个joinSuspend就是在invokeOnCompletion里resume。
+
+### yield
+
+这个也是我个人比较感兴趣的一个地方，虽然平时也不怎么用得上。
+
+先大胆猜测一下，就是把执行剩下逻辑的任务给放回了事件循环的任务队列，并且优先度不高，如果前面有任务则会优先得到调度权。
+
+```kotlin
+public suspend fun yield(): Unit = suspendCoroutineUninterceptedOrReturn sc@ { uCont ->
+    val context = uCont.context
+    context.ensureActive()
+    val cont = uCont.intercepted() as? DispatchedContinuation<Unit> ?: return@sc Unit
+    if (cont.dispatcher.isDispatchNeeded(context)) {
+        // this is a regular dispatcher -- do simple dispatchYield
+        cont.dispatchYield(context, Unit)
+    } else {
+        // This is either an "immediate" dispatcher or the Unconfined dispatcher
+        // This code detects the Unconfined dispatcher even if it was wrapped into another dispatcher
+        val yieldContext = YieldContext()
+        cont.dispatchYield(context + yieldContext, Unit)
+        // Special case for the unconfined dispatcher that can yield only in existing unconfined loop
+        if (yieldContext.dispatcherWasUnconfined) {
+            // Means that the Unconfined dispatcher got the call, but did not do anything.
+            // See also code of "Unconfined.dispatch" function.
+            return@sc if (cont.yieldUndispatched()) COROUTINE_SUSPENDED else Unit
+        }
+        // Otherwise, it was some other dispatcher that successfully dispatched the coroutine
+    }
+    COROUTINE_SUSPENDED
+}
+```
+
+首先尝试拿到DispatchedContinuation，如果拿不到就立刻返回，也就是说yield在这种情况下是没有用的，换句话说在suspend main里它会直接返回。
+
+然后判断是否需要dispatch，需要就调用dispatchYield（大部分情况下时需要的，除了Dispatchers.Unconfined和某些自定义的即刻执行不切换调用栈的调度器），不需要的话就说明是Unconfined调度器，专门为它准备了一个`YieldContext`，难怪说Unconfined是为yield而生的。
+
+```kotlin
+internal fun dispatchYield(context: CoroutineContext, value: T) {
+    _state = value
+    resumeMode = MODE_CANCELLABLE
+    dispatcher.dispatchYield(context, this)
+}
+```
+
+看看默认调度器中dispatchYield的实现
+
+```kotlin
+@InternalCoroutinesApi
+override fun dispatchYield(context: CoroutineContext, block: Runnable) {
+    DefaultScheduler.dispatchWithContext(block, BlockingContext, true)
+}
+```
+
+```kotlin
+internal fun dispatchWithContext(block: Runnable, context: TaskContext, tailDispatch: Boolean) {
+    coroutineScheduler.dispatch(block, context, tailDispatch)
+}
+```
+
+看参数名就能看出来，dispatchYield就是把任务分发到队列尾部，说明我们前面猜对了，继续分析
+
+~~~kotlin
+if (yieldContext.dispatcherWasUnconfined) {
+   	return@sc if (cont.yieldUndispatched()) COROUTINE_SUSPENDED else Unit
+}
+~~~
+
+```kotlin
+internal fun DispatchedContinuation<Unit>.yieldUndispatched(): Boolean =
+    executeUnconfined(Unit, MODE_CANCELLABLE, doYield = true) {
+        run()
+    }
+```
+
+```kotlin
+private inline fun DispatchedContinuation<*>.executeUnconfined(
+    contState: Any?, mode: Int, doYield: Boolean = false,
+    block: () -> Unit
+): Boolean {
+    assert { mode != MODE_UNINITIALIZED } // invalid execution mode
+    val eventLoop = ThreadLocalEventLoop.eventLoop
+    // If we are yielding and unconfined queue is empty, we can bail out as part of fast path
+    if (doYield && eventLoop.isUnconfinedQueueEmpty) return false
+    return if (eventLoop.isUnconfinedLoopActive) {
+        // When unconfined loop is active -- dispatch continuation for execution to avoid stack overflow
+        _state = contState
+        resumeMode = mode
+        eventLoop.dispatchUnconfined(this)
+        true // queued into the active loop
+    } else {
+        // Was not active -- run event loop until all unconfined tasks are executed
+        runUnconfinedEventLoop(eventLoop, block = block)
+        false
+    }
+}
+```
+
+如果是用Unconfined这个Dispatcher，会执行executeUnconfined，如果当前事件循环中UnconfinedQueue为空则不挂起，直接返回。否则挂起。如果不是这个Dispatcher则直接挂起等待唤醒。
+
+### sequence
 
 ### Channel
 
