@@ -1,6 +1,11 @@
 package suspend
 
-import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.actor
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.*
@@ -9,10 +14,10 @@ private val scheduler = Executors.newScheduledThreadPool(1) {
     Thread(it).apply { isDaemon = true }
 }
 
-suspend fun main() {
-    withContext(Dispatchers.Unconfined) { yield() }
-    delay(1000)
-    yield()
+suspend fun main(): Unit = coroutineScope {
+    flow {
+        emit(1)
+    }.catch {  }
 }
 
 suspend fun test() = suspendCoroutine {

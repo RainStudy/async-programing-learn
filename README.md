@@ -1864,11 +1864,497 @@ private inline fun DispatchedContinuation<*>.executeUnconfined(
 
 如果是用Unconfined这个Dispatcher，会执行executeUnconfined，如果当前事件循环中UnconfinedQueue为空则不挂起，直接返回。否则挂起。如果不是这个Dispatcher则直接挂起等待唤醒。
 
+#### 总结
+
+基本思路就是把任务放回任务队列，让其他任务先执行
+
 ### sequence
+
+```kotlin
+fun main() {
+    val seq = sequence {
+        yield(1)
+        yield(2)
+    }
+    for (i in seq) {
+        println(i)
+    }
+}
+```
+
+这个就是kotlin标准库中提供的序列生成器实现，相当于js，python的generator，不过众所周知，它是堵塞的，使用它也不需要开启协程。那我们为什么要研究它呢？
+
+```kotlin
+public fun <T> sequence(@BuilderInference block: suspend SequenceScope<T>.() -> Unit): Sequence<T> = Sequence { iterator(block) }
+```
+
+原来它也是协程的api实现的，但它并不需要在协程作用域中才能使用，有点意思。每次yield就像是手动调用了一次invokeSuspend。并且我们发现在SequenceScope这个协程作用域中只能调用yield这个挂起函数。
+
+```kotlin
+@RestrictsSuspension
+@SinceKotlin("1.3")
+public abstract class SequenceScope<in T> internal constructor() {
+    public abstract suspend fun yield(value: T)
+
+    public abstract suspend fun yieldAll(iterator: Iterator<T>)
+
+    public suspend fun yieldAll(elements: Iterable<T>) {
+        if (elements is Collection && elements.isEmpty()) return
+        return yieldAll(elements.iterator())
+    }
+
+    public suspend fun yieldAll(sequence: Sequence<T>) = yieldAll(sequence.iterator())
+}
+```
+
+是因为打了`@RestrictSuspension`这个注解，在这个作用域内只能调用作用域内定义的挂起函数。我们继续研究
+
+```kotlin
+@SinceKotlin("1.3")
+public fun <T> sequence(@BuilderInference block: suspend SequenceScope<T>.() -> Unit): Sequence<T> = Sequence { iterator(block) }
+
+public fun <T> iterator(@BuilderInference block: suspend SequenceScope<T>.() -> Unit): Iterator<T> {
+    val iterator = SequenceBuilderIterator<T>()
+    iterator.nextStep = block.createCoroutineUnintercepted(receiver = iterator, completion = iterator)
+    return iterator
+}
+```
+
+~~~kotlin
+public inline fun <T> Sequence(crossinline iterator: () -> Iterator<T>): Sequence<T> = object : Sequence<T> {
+    override fun iterator(): Iterator<T> = iterator()
+}
+~~~
+
+看来突破口在SequenceBuilderIterator这个类里面
+
+```kotlin
+private class SequenceBuilderIterator<T> : SequenceScope<T>(), Iterator<T>, Continuation<Unit> {
+    private var state = State_NotReady
+    private var nextValue: T? = null
+    private var nextIterator: Iterator<T>? = null
+    var nextStep: Continuation<Unit>? = null
+
+    override fun hasNext(): Boolean {
+        while (true) {
+            when (state) {
+                State_NotReady -> {}
+                State_ManyNotReady ->
+                    if (nextIterator!!.hasNext()) {
+                        state = State_ManyReady
+                        return true
+                    } else {
+                        nextIterator = null
+                    }
+                State_Done -> return false
+                State_Ready, State_ManyReady -> return true
+                else -> throw exceptionalState()
+            }
+
+            state = State_Failed
+            val step = nextStep!!
+            nextStep = null
+            step.resume(Unit)
+        }
+    }
+
+    override fun next(): T {
+        when (state) {
+            State_NotReady, State_ManyNotReady -> return nextNotReady()
+            State_ManyReady -> {
+                state = State_ManyNotReady
+                return nextIterator!!.next()
+            }
+            State_Ready -> {
+                state = State_NotReady
+                @Suppress("UNCHECKED_CAST")
+                val result = nextValue as T
+                nextValue = null
+                return result
+            }
+            else -> throw exceptionalState()
+        }
+    }
+
+    private fun nextNotReady(): T {
+        if (!hasNext()) throw NoSuchElementException() else return next()
+    }
+
+    private fun exceptionalState(): Throwable = when (state) {
+        State_Done -> NoSuchElementException()
+        State_Failed -> IllegalStateException("Iterator has failed.")
+        else -> IllegalStateException("Unexpected state of the iterator: $state")
+    }
+
+
+    override suspend fun yield(value: T) {
+        nextValue = value
+        state = State_Ready
+        return suspendCoroutineUninterceptedOrReturn { c ->
+            nextStep = c
+            COROUTINE_SUSPENDED
+        }
+    }
+
+    override suspend fun yieldAll(iterator: Iterator<T>) {
+        if (!iterator.hasNext()) return
+        nextIterator = iterator
+        state = State_ManyReady
+        return suspendCoroutineUninterceptedOrReturn { c ->
+            nextStep = c
+            COROUTINE_SUSPENDED
+        }
+    }
+
+    // Completion continuation implementation
+    override fun resumeWith(result: Result<Unit>) {
+        result.getOrThrow() // just rethrow exception if it is there
+        state = State_Done
+    }
+
+    override val context: CoroutineContext
+        get() = EmptyCoroutineContext
+}
+```
+
+如你所见，它是个迭代器，同时也是SequenceScope和Continuation。它的内部保存了一个状态，并且在执行next() / hasNext()时进行状态流转。那么我们先来分析它的执行流程
+
+~~~kotlin
+block.createCoroutineUnintercepted(receiver = iterator, completion = iterator)
+~~~
+
+然后协程启动后在其中调用yield，观察代码我们就知道，yield必然返回挂起标记，也就是说必然挂起，并更新state为State_Ready和nextValue。这个时候就等着我们调用next了，调用了next会检查之前是否调用过hasNext，如果没调用过就调用，在hasNext中resume nextStep得到下一个值，逻辑就会继续往下执行到下一个挂起点并立刻返回当前的nextValue。
+
+那这不就分析完了，还挺简单的？原理就是invokeSuspend的流程交给用户手动控制，调用一次next就相当于invokeSuspend一次。
 
 ### Channel
 
+其实就是一个非堵塞队列，缓冲区大小对应的就是队列大小。队列塞满了就挂起等待消费者消费掉元素有空间了再恢复。但我个人一般常用的是无缓冲区Channel，所以一开始并没能把它与堵塞队列联想到一起。
+
+那老规矩，看看源码
+
+~~~kotlin
+public fun <E> Channel(
+    capacity: Int = RENDEZVOUS,
+    onBufferOverflow: BufferOverflow = BufferOverflow.SUSPEND,
+    onUndeliveredElement: ((E) -> Unit)? = null
+): Channel<E> =
+    when (capacity) {
+        RENDEZVOUS -> {
+            if (onBufferOverflow == BufferOverflow.SUSPEND)
+                RendezvousChannel(onUndeliveredElement) // an efficient implementation of rendezvous channel
+            else
+                ArrayChannel(1, onBufferOverflow, onUndeliveredElement) // support buffer overflow with buffered channel
+        }
+        CONFLATED -> {
+            require(onBufferOverflow == BufferOverflow.SUSPEND) {
+                "CONFLATED capacity cannot be used with non-default onBufferOverflow"
+            }
+            ConflatedChannel(onUndeliveredElement)
+        }
+        UNLIMITED -> LinkedListChannel(onUndeliveredElement) // ignores onBufferOverflow: it has buffer, but it never overflows
+        BUFFERED -> ArrayChannel( // uses default capacity with SUSPEND
+            if (onBufferOverflow == BufferOverflow.SUSPEND) CHANNEL_DEFAULT_CAPACITY else 1,
+            onBufferOverflow, onUndeliveredElement
+        )
+        else -> {
+            if (capacity == 1 && onBufferOverflow == BufferOverflow.DROP_OLDEST)
+                ConflatedChannel(onUndeliveredElement) // conflated implementation is more efficient but appears to work in the same way
+            else
+                ArrayChannel(capacity, onBufferOverflow, onUndeliveredElement)
+        }
+    }
+~~~
+
+嗯，根据不同的缓冲区大小选择不同的实现，那先从我最常用的无缓冲区channel的实现`RendezvousChannel`开始看起
+
+```kotlin
+internal open class RendezvousChannel<E>(onUndeliveredElement: OnUndeliveredElement<E>?) : AbstractChannel<E>(onUndeliveredElement) {
+    protected final override val isBufferAlwaysEmpty: Boolean get() = true
+    protected final override val isBufferEmpty: Boolean get() = true
+    protected final override val isBufferAlwaysFull: Boolean get() = true
+    protected final override val isBufferFull: Boolean get() = true
+}
+```
+
+信息不多，那必须得看看父类啊。我们从receive和send的实现开始看起：
+
+先看send
+
+```kotlin
+public final override suspend fun send(element: E) {
+    // fast path -- try offer non-blocking
+    if (offerInternal(element) === OFFER_SUCCESS) return
+    // slow-path does suspend or throws exception
+    return sendSuspend(element)
+}
+```
+
+```kotlin
+protected open fun offerInternal(element: E): Any {
+    while (true) {
+        val receive = takeFirstReceiveOrPeekClosed() ?: return OFFER_FAILED
+        val token = receive.tryResumeReceive(element, null)
+        if (token != null) {
+            assert { token === RESUME_TOKEN }
+            receive.completeResumeReceive(element)
+            return receive.offerResult
+        }
+    }
+}
+```
+
+```kotlin
+private suspend fun sendSuspend(element: E): Unit = suspendCancellableCoroutineReusable sc@ { cont ->
+    loop@ while (true) {
+        if (isFullImpl) {
+            val send = if (onUndeliveredElement == null)
+                SendElement(element, cont) else
+                SendElementWithUndeliveredHandler(element, cont, onUndeliveredElement)
+            val enqueueResult = enqueueSend(send)
+            when {
+                enqueueResult == null -> { // enqueued successfully
+                    cont.removeOnCancellation(send)
+                    return@sc
+                }
+                enqueueResult is Closed<*> -> {
+                    cont.helpCloseAndResumeWithSendException(element, enqueueResult)
+                    return@sc
+                }
+                enqueueResult === ENQUEUE_FAILED -> {} // try to offer instead
+                enqueueResult is Receive<*> -> {} // try to offer instead
+                else -> error("enqueueSend returned $enqueueResult")
+            }
+        }
+        // hm... receiver is waiting or buffer is not full. try to offer
+        val offerResult = offerInternal(element)
+        when {
+            offerResult === OFFER_SUCCESS -> {
+                cont.resume(Unit)
+                return@sc
+            }
+            offerResult === OFFER_FAILED -> continue@loop
+            offerResult is Closed<*> -> {
+                cont.helpCloseAndResumeWithSendException(element, offerResult)
+                return@sc
+            }
+            else -> error("offerInternal returned $offerResult")
+        }
+    }
+}
+```
+
+首先将元素放入队列，加入这个时候有协程正在receive这个channel就直接返回，不挂起，同时把正在挂起的receive侧协程也恢复了。如果没有的话就调用sendSuspend挂起等待receive。如果进到sendSuspend这个流程后channel关闭了，就会抛出异常。
+
+再看看receive，估计也差不多
+
+```kotlin
+public final override suspend fun receive(): E {
+    // fast path -- try poll non-blocking
+    val result = pollInternal()
+    /*
+     * If result is Closed -- go to tail-call slow-path that will allow us to
+     * properly recover stacktrace without paying a performance cost on fast path.
+     * We prefer to recover stacktrace using suspending path to have a more precise stacktrace.
+     */
+    @Suppress("UNCHECKED_CAST")
+    if (result !== POLL_FAILED && result !is Closed<*>) return result as E
+    // slow-path does suspend
+    return receiveSuspend(RECEIVE_THROWS_ON_CLOSE)
+}
+```
+
+```kotlin
+protected open fun pollInternal(): Any? {
+    while (true) {
+        val send = takeFirstSendOrPeekClosed() ?: return POLL_FAILED
+        val token = send.tryResumeSend(null)
+        if (token != null) {
+            assert { token === RESUME_TOKEN }
+            send.completeResumeSend()
+            return send.pollResult
+        }
+        // too late, already cancelled, but we removed it from the queue and need to notify on undelivered element
+        send.undeliveredElement()
+    }
+}
+```
+
+确实，尝试从队列中取出元素，如果队列为空则挂起等待。
+
 ### Flow
+
+终于到了我们的重头戏flow，这可基本上是安卓开发中最常用的kotlin协程api了。
+
+```kotlin
+public fun <T> flow(@BuilderInference block: suspend FlowCollector<T>.() -> Unit): Flow<T> = SafeFlow(block)
+```
+
+```kotlin
+private class SafeFlow<T>(private val block: suspend FlowCollector<T>.() -> Unit) : AbstractFlow<T>() {
+    override suspend fun collectSafely(collector: FlowCollector<T>) {
+        collector.block()
+    }
+}
+```
+
+```kotlin
+@FlowPreview
+public abstract class AbstractFlow<T> : Flow<T>, CancellableFlow<T> {
+
+    public final override suspend fun collect(collector: FlowCollector<T>) {
+        val safeCollector = SafeCollector(collector, coroutineContext)
+        try {
+            collectSafely(safeCollector)
+        } finally {
+            safeCollector.releaseIntercepted()
+        }
+    }
+
+    public abstract suspend fun collectSafely(collector: FlowCollector<T>)
+}
+```
+
+```kotlin
+public interface Flow<out T> {
+    public suspend fun collect(collector: FlowCollector<T>)
+}
+```
+
+没想到本体代码量这么少，各种操作符都是用拓展函数实现的，这样看来确实比rxjava的实现要简洁得多。
+
+看样子就是把传入的suspend lambda给保存下来了，然后在collect的时候传入参数调用，很简单。
+
+那看点常见的操作符？
+
+#### operator
+
+##### transform - 转换
+
+transform是最基础的操作符，基本所有操作符都是在transform的基础上封装的，它的功能简单而又强大。
+
+```kotlin
+public inline fun <T, R> Flow<T>.transform(
+    @BuilderInference crossinline transform: suspend FlowCollector<R>.(value: T) -> Unit
+): Flow<R> = flow { // Note: safe flow is used here, because collector is exposed to transform on each operation
+    collect { value ->
+        // kludge, without it Unit will be returned and TCE won't kick in, KT-28938
+        return@collect transform(value)
+    }
+}
+```
+
+原来如此，就是新开了个flow，然后collect旧的flow，然后执行传入的transform action把转换过的新值发给新流。然后这玩意原理上就没什么好琢磨的了，再看看线程切换的操作符
+
+##### flowOn - 线程切换
+
+不同于rxjava的subscribeOn和observeOn，flow只有flowOn
+
+```kotlin
+public fun <T> Flow<T>.flowOn(context: CoroutineContext): Flow<T> {
+    checkFlowContext(context)
+    return when {
+        context == EmptyCoroutineContext -> this
+        this is FusibleFlow -> fuse(context = context)
+        else -> ChannelFlowOperatorImpl(this, context = context)
+    }
+}
+```
+
+似乎就是返回一个换下context的新流
+
+```kotlin
+internal class ChannelFlowOperatorImpl<T>(
+    flow: Flow<T>,
+    context: CoroutineContext = EmptyCoroutineContext,
+    capacity: Int = Channel.OPTIONAL_CHANNEL,
+    onBufferOverflow: BufferOverflow = BufferOverflow.SUSPEND
+) : ChannelFlowOperator<T, T>(flow, context, capacity, onBufferOverflow) {
+    override fun create(context: CoroutineContext, capacity: Int, onBufferOverflow: BufferOverflow): ChannelFlow<T> =
+        ChannelFlowOperatorImpl(flow, context, capacity, onBufferOverflow)
+
+    override fun dropChannelOperators(): Flow<T> = flow
+
+    override suspend fun flowCollect(collector: FlowCollector<T>) =
+        flow.collect(collector)
+}
+```
+
+于是效果就是影响上游的没有自己Dispatcher的操作符。
+
+##### onXXX - 流程操作符
+
+onStart / onEach / onCompletion
+
+```kotlin
+public fun <T> Flow<T>.onStart(
+    action: suspend FlowCollector<T>.() -> Unit
+): Flow<T> = unsafeFlow { // Note: unsafe flow is used here, but safe collector is used to invoke start action
+    val safeCollector = SafeCollector<T>(this, currentCoroutineContext())
+    try {
+        safeCollector.action()
+    } finally {
+        safeCollector.releaseIntercepted()
+    }
+    collect(this) // directly delegate
+}
+```
+
+在collect之前加上一段逻辑，就是onStart
+
+```kotlin
+public fun <T> Flow<T>.onEach(action: suspend (T) -> Unit): Flow<T> = transform { value ->
+    action(value)
+    return@transform emit(value)
+}
+```
+
+没想到这个居然使用transform实现，不过仔细想想好像也对。在每个值发送之前执行一段逻辑，就是onEach
+
+```kotlin
+public fun <T> Flow<T>.onCompletion(
+    action: suspend FlowCollector<T>.(cause: Throwable?) -> Unit
+): Flow<T> = unsafeFlow { // Note: unsafe flow is used here, but safe collector is used to invoke completion action
+    try {
+        collect(this)
+    } catch (e: Throwable) {
+        /*
+         * Use throwing collector to prevent any emissions from the
+         * completion sequence when downstream has failed, otherwise it may
+         * lead to a non-sequential behaviour impossible with `finally`
+         */
+        ThrowingCollector(e).invokeSafely(action, e)
+        throw e
+    }
+    // Normal completion
+    val sc = SafeCollector(this, currentCoroutineContext())
+    try {
+        sc.action(null)
+    } finally {
+        sc.releaseIntercepted()
+    }
+}
+```
+
+嗯，这段就是在collect上层flow之后再做一些操作
+
+都不难啊
+
+##### catch - 异常处理
+
+
+
+#### channelFlow - 热流
+
+
+
+##### StateFlow
+
+
+
+##### SharedFlow
+
+
 
 ### select
 
