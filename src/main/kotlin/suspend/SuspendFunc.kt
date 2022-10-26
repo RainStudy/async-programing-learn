@@ -17,7 +17,7 @@ private val scheduler = Executors.newScheduledThreadPool(1) {
 suspend fun main(): Unit = coroutineScope {
     flow {
         emit(1)
-    }.catch {  }
+    }
 }
 
 suspend fun test() = suspendCoroutine {
