@@ -2261,7 +2261,7 @@ public fun <T> Flow<T>.flowOn(context: CoroutineContext): Flow<T> {
 }
 ```
 
-似乎就是返回一个换下context的新流
+似乎就是返回一个换下context的新流，至于这里为什么要用ChannelFlow，是因为flow不支持在发送时进行线程切换。
 
 ```kotlin
 internal class ChannelFlowOperatorImpl<T>(
@@ -2336,25 +2336,9 @@ public fun <T> Flow<T>.onCompletion(
 }
 ```
 
-嗯，这段就是在collect上层flow之后再做一些操作
+嗯，这段就是在collect上层flow之后再做一些操作。
 
-都不难啊
-
-##### catch - 异常处理
+都不难啊。
 
 
-
-#### channelFlow - 热流
-
-
-
-##### StateFlow
-
-
-
-##### SharedFlow
-
-
-
-### select
 
